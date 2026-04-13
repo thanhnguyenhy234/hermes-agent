@@ -48,6 +48,16 @@ _COMPLEX_KEYWORDS = {
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
+_SIMPLE_COMMAND_PREFIXES = (
+    "tk",
+    "tv",
+    "ts a",
+    "/tk",
+    "/tv",
+    "/ts a",
+)
+
+
 def _coerce_bool(value: Any, default: bool = False) -> bool:
     return is_truthy_value(value, default=default)
 
@@ -80,6 +90,14 @@ def choose_cheap_model_route(user_message: str, routing_config: Optional[Dict[st
     text = (user_message or "").strip()
     if not text:
         return None
+
+    lowered = text.lower()
+    if lowered.startswith(_SIMPLE_COMMAND_PREFIXES):
+        route = dict(cheap_model)
+        route["provider"] = provider
+        route["model"] = model
+        route["routing_reason"] = "simple_command"
+        return route
 
     max_chars = _coerce_int(cfg.get("max_simple_chars"), 160)
     max_words = _coerce_int(cfg.get("max_simple_words"), 28)

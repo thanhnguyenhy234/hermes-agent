@@ -38,6 +38,31 @@ def test_skips_tool_heavy_prompt_keywords():
     assert choose_cheap_model_route(prompt, _BASE_CONFIG) is None
 
 
+def test_routes_simple_task_command_prefixes():
+    result = choose_cheap_model_route("tk van ban den", _BASE_CONFIG)
+    assert result is not None
+    assert result["routing_reason"] == "simple_command"
+
+    result = choose_cheap_model_route("/ts a", _BASE_CONFIG)
+    assert result is not None
+    assert result["routing_reason"] == "simple_command"
+
+
+def test_routes_simple_task_command_prefixes_to_gpt_mini_when_configured():
+    cfg = {
+        "enabled": True,
+        "cheap_model": {
+            "provider": "custom",
+            "model": "gpt-5.4-mini",
+        },
+    }
+    result = choose_cheap_model_route("tv hoi lai ten chi bo", cfg)
+    assert result is not None
+    assert result["provider"] == "custom"
+    assert result["model"] == "gpt-5.4-mini"
+    assert result["routing_reason"] == "simple_command"
+
+
 def test_resolve_turn_route_falls_back_to_primary_when_route_runtime_cannot_be_resolved(monkeypatch):
     from agent.smart_model_routing import resolve_turn_route
 

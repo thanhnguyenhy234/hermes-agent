@@ -59,6 +59,28 @@ SILENT_MARKER = "[SILENT]"
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = get_hermes_home()
 
+
+def _looks_like_agent_failure_text(text: str) -> bool:
+    """Detect when the agent returned an internal provider/auth failure as plain text.
+
+    Some provider/runtime failures are surfaced as a final assistant message instead of
+    raising an exception. For cron jobs that's shitty UX: the scheduler marks the run as
+    success, and users get no clear failure signal. Treat these as job failures so cron
+    can send an explicit fallback error notification.
+    """
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    failure_markers = (
+        "api call failed after",
+        "auth_unavailable",
+        "no auth available",
+        "authentication failed",
+        "provider auth failed",
+        "runtimeerror: no anthropic credentials found",
+    )
+    return any(marker in normalized for marker in failure_markers)
+
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
@@ -837,6 +859,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         final_response = result.get("final_response", "") or ""
+        if _looks_like_agent_failure_text(final_response):
+            raise RuntimeError(final_response.strip())
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
