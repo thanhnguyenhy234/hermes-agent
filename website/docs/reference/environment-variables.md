@@ -168,6 +168,10 @@ For cloud sandbox backends, persistence is filesystem-oriented. `TERMINAL_LIFETI
 | `TELEGRAM_WEBHOOK_URL` | Public HTTPS URL for webhook mode (enables webhook instead of polling) |
 | `TELEGRAM_WEBHOOK_PORT` | Local listen port for webhook server (default: `8443`) |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret token for verifying updates come from Telegram |
+| `TELEGRAM_REQUIRE_MENTION` | Require mention/reply/command triggers in Telegram groups instead of responding to all visible messages |
+| `TELEGRAM_MENTION_PATTERNS` | JSON array or newline/comma-separated regex wake words for Telegram groups |
+| `TELEGRAM_FREE_RESPONSE_CHATS` | Comma-separated Telegram chat IDs that bypass mention requirements |
+| `TELEGRAM_IGNORED_THREADS` | Comma-separated `chat_id:thread_id` topic mappings that Hermes always ignores |
 | `TELEGRAM_REACTIONS` | Enable emoji reactions on messages during processing (default: `false`) |
 | `DISCORD_BOT_TOKEN` | Discord bot token |
 | `DISCORD_ALLOWED_USERS` | Comma-separated Discord user IDs allowed to use the bot |

@@ -48,9 +48,9 @@ def _group_message(
         caption=caption,
         entities=entities or [],
         caption_entities=caption_entities or [],
-        message_thread_id=thread_id,
         chat=SimpleNamespace(id=chat_id, type="group"),
         reply_to_message=reply_to_message,
+        message_thread_id=thread_id,
     )
 
 
@@ -97,6 +97,23 @@ def test_regex_mention_patterns_allow_custom_wake_words():
     assert adapter._should_process_message(_group_message("hey chompy")) is False
 
 
+def test_ignored_threads_block_even_with_direct_triggers():
+    adapter = _make_adapter(require_mention=False, ignored_threads=["-200:17"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=17)) is False
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", chat_id=-200, thread_id=17, entities=[_mention_entity("hi @hermes_bot")])
+    ) is False
+    assert adapter._should_process_message(_group_message("/status", chat_id=-200, thread_id=17), is_command=True) is False
+
+
+def test_non_ignored_threads_continue_processing():
+    adapter = _make_adapter(require_mention=False, ignored_threads=["-200:17"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=18)) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
+
+
 def test_invalid_regex_patterns_are_ignored():
     adapter = _make_adapter(require_mention=True, mention_patterns=[r"(", r"^\s*chompy\b"])
 
@@ -113,7 +130,9 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "  mention_patterns:\n"
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
-        "    - \"-123\"\n",
+        "    - \"-123\"\n"
+        "  ignored_threads:\n"
+        "    - \"-123:77\"\n",
         encoding="utf-8",
     )
 
@@ -121,6 +140,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("TELEGRAM_MENTION_PATTERNS", raising=False)
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_IGNORED_THREADS", raising=False)
 
     config = load_gateway_config()
 
@@ -128,9 +148,10 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION"] == "true"
     assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_IGNORED_THREADS"] == "-123:77"
 
 
-def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):
+def test_config_bridges_telegram_numeric_ignored_threads(monkeypatch, tmp_path):
     hermes_home = tmp_path / ".hermes"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(

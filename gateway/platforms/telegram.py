@@ -2012,26 +2012,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
-    def _telegram_ignored_threads(self) -> set[int]:
+    def _telegram_ignored_threads(self) -> set[str]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
             raw = os.getenv("TELEGRAM_IGNORED_THREADS", "")
-
         if isinstance(raw, list):
-            values = raw
-        else:
-            values = str(raw).split(",")
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
 
-        ignored: set[int] = set()
-        for value in values:
-            text = str(value).strip()
-            if not text:
-                continue
-            try:
-                ignored.add(int(text))
-            except (TypeError, ValueError):
-                logger.warning("[%s] Ignoring invalid Telegram thread id: %r", self.name, value)
-        return ignored
+    def _message_in_ignored_thread(self, message: Message) -> bool:
+        chat = getattr(message, "chat", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        if not chat or thread_id is None:
+            return False
+        ignored_threads = self._telegram_ignored_threads()
+        thread_key = f"{getattr(chat, 'id', '')}:{thread_id}"
+        if thread_key in ignored_threads:
+            return True
+        return str(thread_id).strip() in ignored_threads
 
     def _compile_mention_patterns(self) -> List[re.Pattern]:
         """Compile optional regex wake-word patterns for group triggers."""
@@ -2134,7 +2132,8 @@ class TelegramAdapter(BasePlatformAdapter):
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
-        DMs remain unrestricted. Group/supergroup messages are accepted when:
+        Topic threads listed in ``ignored_threads`` are always rejected first.
+        DMs remain unrestricted otherwise. Group/supergroup messages are accepted when:
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message is a command
@@ -2142,15 +2141,10 @@ class TelegramAdapter(BasePlatformAdapter):
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
         """
+        if self._message_in_ignored_thread(message):
+            return False
         if not self._is_group_chat(message):
             return True
-        thread_id = getattr(message, "message_thread_id", None)
-        if thread_id is not None:
-            try:
-                if int(thread_id) in self._telegram_ignored_threads():
-                    return False
-            except (TypeError, ValueError):
-                logger.warning("[%s] Ignoring non-numeric Telegram message_thread_id: %r", self.name, thread_id)
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
         if not self._telegram_require_mention():
