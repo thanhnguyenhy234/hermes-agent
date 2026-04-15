@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 
-def _make_adapter(require_mention=None, free_response_chats=None, mention_patterns=None, ignored_threads=None):
+def _make_adapter(require_mention=None, free_response_chats=None, free_response_topics=None, mention_patterns=None, ignored_threads=None):
     from gateway.platforms.telegram import TelegramAdapter
 
     extra = {}
@@ -13,6 +13,8 @@ def _make_adapter(require_mention=None, free_response_chats=None, mention_patter
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if free_response_topics is not None:
+        extra["free_response_topics"] = free_response_topics
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if ignored_threads is not None:
@@ -81,6 +83,13 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_topic_messages_can_bypass_mention_requirement_when_enabled():
+    adapter = _make_adapter(require_mention=True, free_response_topics=True)
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200, thread_id=17)) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+
+
 def test_ignored_threads_drop_group_messages_before_other_gates():
     adapter = _make_adapter(require_mention=False, free_response_chats=["-200"], ignored_threads=[31, "42"])
 
@@ -131,6 +140,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
+        "  free_response_topics: true\n"
         "  ignored_threads:\n"
         "    - \"-123:77\"\n",
         encoding="utf-8",
@@ -140,6 +150,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("TELEGRAM_MENTION_PATTERNS", raising=False)
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_TOPICS", raising=False)
     monkeypatch.delenv("TELEGRAM_IGNORED_THREADS", raising=False)
 
     config = load_gateway_config()
@@ -148,6 +159,7 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_REQUIRE_MENTION"] == "true"
     assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_TOPICS"] == "true"
     assert __import__("os").environ["TELEGRAM_IGNORED_THREADS"] == "-123:77"
 
 

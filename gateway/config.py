@@ -625,6 +625,8 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(frc, list):
                         frc = ",".join(str(v) for v in frc)
                     os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] = str(frc)
+                if "free_response_topics" in telegram_cfg and not os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS"):
+                    os.environ["TELEGRAM_FREE_RESPONSE_TOPICS"] = str(telegram_cfg["free_response_topics"]).lower()
                 ignored_threads = telegram_cfg.get("ignored_threads")
                 if ignored_threads is not None and not os.getenv("TELEGRAM_IGNORED_THREADS"):
                     if isinstance(ignored_threads, list):

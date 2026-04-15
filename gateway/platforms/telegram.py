@@ -2012,6 +2012,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_free_response_topics(self) -> bool:
+        configured = self.config.extra.get("free_response_topics")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in ("true", "1", "yes", "on")
+            return bool(configured)
+        return os.getenv("TELEGRAM_FREE_RESPONSE_TOPICS", "false").lower() in ("true", "1", "yes", "on")
+
     def _telegram_ignored_threads(self) -> set[str]:
         raw = self.config.extra.get("ignored_threads")
         if raw is None:
@@ -2134,6 +2142,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         Topic threads listed in ``ignored_threads`` are always rejected first.
         DMs remain unrestricted otherwise. Group/supergroup messages are accepted when:
+        - the message is posted inside a topic and ``free_response_topics`` is enabled
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message is a command
@@ -2144,6 +2153,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._message_in_ignored_thread(message):
             return False
         if not self._is_group_chat(message):
+            return True
+        if getattr(message, "message_thread_id", None) is not None and self._telegram_free_response_topics():
             return True
         if str(getattr(getattr(message, "chat", None), "id", "")) in self._telegram_free_response_chats():
             return True
