@@ -233,6 +233,71 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_default_delivery_uses_configured_platform(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "telegram"}}):
+            job = create_job(
+                prompt="Test",
+                schedule="30m",
+                origin={"platform": "discord", "chat_id": "123"},
+            )
+        assert job["deliver"] == "telegram"
+
+    def test_default_delivery_origin_alias_falls_back_to_local_without_origin(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "current_chat"}}):
+            job = create_job(prompt="Test", schedule="30m")
+        assert job["deliver"] == "local"
+
+    def test_default_delivery_invalid_config_falls_back_to_origin_or_local(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "totally-bogus"}}):
+            with_origin = create_job(
+                prompt="Test",
+                schedule="30m",
+                origin={"platform": "telegram", "chat_id": "123"},
+            )
+            without_origin = create_job(prompt="Test", schedule="30m")
+        assert with_origin["deliver"] == "origin"
+        assert without_origin["deliver"] == "local"
+
+    def test_explicit_deliver_overrides_config_default(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "telegram"}}):
+            job = create_job(
+                prompt="Test",
+                schedule="30m",
+                deliver="origin",
+                origin={"platform": "discord", "chat_id": "123"},
+            )
+        assert job["deliver"] == "origin"
+
+    def test_default_delivery_accepts_explicit_target_string_from_config(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "telegram:-100123:17585"}}):
+            job = create_job(prompt="Test", schedule="30m")
+        assert job["deliver"] == "telegram:-100123:17585"
+
+    def test_default_delivery_home_alias_preserves_legacy_behavior(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "home"}}):
+            with_origin = create_job(
+                prompt="Test",
+                schedule="30m",
+                origin={"platform": "telegram", "chat_id": "123"},
+            )
+            without_origin = create_job(prompt="Test", schedule="30m")
+        assert with_origin["deliver"] == "origin"
+        assert without_origin["deliver"] == "local"
+
+    def test_default_delivery_platform_alias_case_and_whitespace_are_normalized(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "  TeLeGrAm_HoMe  "}}):
+            job = create_job(prompt="Test", schedule="30m")
+        assert job["deliver"] == "telegram"
+
+    def test_default_delivery_local_alias_uses_local(self, tmp_cron_dir):
+        with patch("cron.jobs.load_config", return_value={"cron": {"default_delivery": "save-only"}}):
+            job = create_job(
+                prompt="Test",
+                schedule="30m",
+                origin={"platform": "telegram", "chat_id": "123"},
+            )
+        assert job["deliver"] == "local"
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):

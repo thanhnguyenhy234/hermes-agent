@@ -20,6 +20,55 @@ from typing import Optional, Dict, List, Any
 logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
+from hermes_cli.config import load_config
+
+
+_KNOWN_DELIVERY_PLATFORMS = {
+    "telegram", "discord", "slack", "whatsapp", "signal",
+    "matrix", "mattermost", "homeassistant", "dingtalk", "feishu",
+    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
+    "qqbot",
+}
+
+
+def _resolve_default_delivery(origin: Optional[Dict[str, Any]]) -> str:
+    fallback = "origin" if origin else "local"
+    try:
+        cfg = load_config()
+    except Exception:
+        return fallback
+
+    cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        return fallback
+
+    raw = cron_cfg.get("default_delivery")
+    if not isinstance(raw, str):
+        return fallback
+
+    value = raw.strip()
+    if not value:
+        return fallback
+
+    normalized = value.lower().replace("-", "_")
+    if normalized in {"origin", "current_chat"}:
+        return "origin" if origin else "local"
+    if normalized in {"local", "save_only"}:
+        return "local"
+    if normalized == "home":
+        return fallback
+    if normalized.endswith("_home"):
+        platform = normalized[:-5]
+        return platform if platform in _KNOWN_DELIVERY_PLATFORMS else fallback
+    if ":" in value:
+        return value
+    if normalized in _KNOWN_DELIVERY_PLATFORMS:
+        return normalized
+    return fallback
+
+
+def _normalize_delivery(deliver: Optional[str], origin: Optional[Dict[str, Any]]) -> str:
+    return deliver if deliver is not None else _resolve_default_delivery(origin)
 
 try:
     from croniter import croniter
@@ -411,9 +460,7 @@ def create_job(
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
 
-    # Default delivery to origin if available, otherwise local
-    if deliver is None:
-        deliver = "origin" if origin else "local"
+    deliver = _normalize_delivery(deliver, origin)
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
