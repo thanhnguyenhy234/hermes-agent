@@ -894,101 +894,6 @@ class GatewayRunner:
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
 
-    @staticmethod
-    def _topic_model_group_topics(user_config: Optional[dict]) -> list[dict]:
-        if not isinstance(user_config, dict):
-            return []
-
-        candidates: list = []
-        platforms_cfg = user_config.get("platforms", {})
-        if isinstance(platforms_cfg, dict):
-            telegram_cfg = platforms_cfg.get("telegram", {})
-            if isinstance(telegram_cfg, dict):
-                extra_cfg = telegram_cfg.get("extra", {})
-                if isinstance(extra_cfg, dict) and isinstance(extra_cfg.get("group_topics"), list):
-                    candidates.extend(extra_cfg.get("group_topics") or [])
-
-        legacy_telegram_cfg = user_config.get("telegram", {})
-        if isinstance(legacy_telegram_cfg, dict):
-            extra_cfg = legacy_telegram_cfg.get("extra", {})
-            if isinstance(extra_cfg, dict) and isinstance(extra_cfg.get("group_topics"), list):
-                candidates.extend(extra_cfg.get("group_topics") or [])
-
-        return [entry for entry in candidates if isinstance(entry, dict)]
-
-    def _resolve_source_topic_model_override(
-        self,
-        source: Optional[SessionSource],
-        user_config: Optional[dict],
-    ) -> Optional[dict]:
-        if source is None or not isinstance(user_config, dict):
-            return None
-
-        platform_name = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
-        if str(platform_name).strip().lower() != "telegram":
-            return None
-        if not source.chat_id or not source.thread_id:
-            return None
-
-        chat_id = str(source.chat_id).strip()
-        thread_id = str(source.thread_id).strip()
-        if not chat_id or not thread_id:
-            return None
-
-        for chat_entry in self._topic_model_group_topics(user_config):
-            entry_chat_id = str(chat_entry.get("chat_id", "")).strip()
-            if entry_chat_id != chat_id:
-                continue
-            topics = chat_entry.get("topics", [])
-            if not isinstance(topics, list):
-                continue
-            for topic in topics:
-                if not isinstance(topic, dict):
-                    continue
-                entry_thread_id = str(topic.get("thread_id", "")).strip()
-                if entry_thread_id != thread_id:
-                    continue
-
-                topic_override: dict = {}
-                for key in ("model", "provider", "base_url", "api_key", "api_mode"):
-                    value = topic.get(key)
-                    if isinstance(value, str):
-                        value = value.strip()
-                    if value not in (None, ""):
-                        topic_override[key] = value
-
-                api_key_env = str(topic.get("api_key_env") or "").strip()
-                if api_key_env and not topic_override.get("api_key"):
-                    env_value = os.getenv(api_key_env, "").strip()
-                    if env_value:
-                        topic_override["api_key"] = env_value
-
-                if not topic_override.get("model"):
-                    return None
-
-                topic_override["__topic_name__"] = str(topic.get("name") or "").strip()
-                topic_override["__topic_model_locked__"] = not bool(topic.get("allow_smart_model_routing", False))
-                return topic_override
-
-        return None
-
-    @staticmethod
-    def _apply_runtime_bundle_overrides(runtime_kwargs: dict, override: Optional[dict]) -> dict:
-        merged = dict(runtime_kwargs or {})
-        if not isinstance(override, dict):
-            return merged
-
-        for key in ("provider", "api_key", "base_url", "api_mode"):
-            value = override.get(key)
-            if isinstance(value, str):
-                value = value.strip()
-            if value not in (None, ""):
-                merged[key] = value
-
-        if override.get("__topic_model_locked__"):
-            merged["__topic_model_locked__"] = True
-        return merged
-
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -1044,20 +949,6 @@ class GatewayRunner:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
             )
-        elif source is not None:
-            topic_override = self._resolve_source_topic_model_override(source, user_config)
-            if topic_override:
-                model = topic_override.get("model", model)
-                runtime_kwargs = self._apply_runtime_bundle_overrides(runtime_kwargs, topic_override)
-                logger.debug(
-                    "Topic model override: chat=%s thread=%s topic=%s model=%s provider=%s locked=%s",
-                    str(source.chat_id),
-                    str(source.thread_id),
-                    topic_override.get("__topic_name__") or "?",
-                    model,
-                    runtime_kwargs.get("provider"),
-                    bool(runtime_kwargs.get("__topic_model_locked__")),
-                )
 
         # When the config has no model.default but a provider was resolved
         # (e.g. user ran `hermes auth add openai-codex` without `hermes model`),
@@ -1091,16 +982,7 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-
-        if runtime_kwargs.get("__topic_model_locked__"):
-            locked_runtime = dict(primary)
-            locked_runtime.pop("model", None)
-            route = {
-                "model": model,
-                "runtime": locked_runtime,
-            }
-        else:
-            route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+        route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -3680,7 +3562,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info(source=source)
+                            session_info = self._format_session_info()
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -4395,12 +4277,8 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
     
-    def _format_session_info(
-        self,
-        source: Optional[SessionSource] = None,
-        user_config: Optional[dict] = None,
-    ) -> str:
-        """Resolve current/effective session model config and return a formatted info block.
+    def _format_session_info(self) -> str:
+        """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
@@ -4413,7 +4291,6 @@ class GatewayRunner:
         provider = None
         base_url = None
         api_key = None
-        cfg_data: dict = user_config if isinstance(user_config, dict) else {}
 
         try:
             cfg_path = _hermes_home / "config.yaml"
@@ -4421,9 +4298,7 @@ class GatewayRunner:
                 import yaml as _info_yaml
                 with open(cfg_path, encoding="utf-8") as f:
                     data = _info_yaml.safe_load(f) or {}
-                if isinstance(data, dict):
-                    cfg_data = data
-                model_cfg = cfg_data.get("model", {})
+                model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
                     raw_ctx = model_cfg.get("context_length")
                     if raw_ctx is not None:
@@ -4444,24 +4319,6 @@ class GatewayRunner:
             api_key = runtime.get("api_key")
         except Exception:
             pass
-
-        # If a concrete source/thread is known, prefer the effective runtime for
-        # that session so /reset and auto-reset notices reflect topic-specific
-        # model overrides instead of only the global default.
-        if source is not None:
-            try:
-                effective_model, effective_runtime = self._resolve_session_agent_runtime(
-                    source=source,
-                    user_config=cfg_data,
-                )
-                if effective_model:
-                    model = effective_model
-                if isinstance(effective_runtime, dict):
-                    provider = effective_runtime.get("provider") or provider
-                    base_url = effective_runtime.get("base_url") or base_url
-                    api_key = effective_runtime.get("api_key") or api_key
-            except Exception:
-                pass
 
         context_length = get_model_context_length(
             model,
@@ -4574,7 +4431,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info(source=source)
+            session_info = self._format_session_info()
         except Exception:
             session_info = ""
 

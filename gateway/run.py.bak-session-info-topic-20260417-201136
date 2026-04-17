@@ -3680,7 +3680,7 @@ class GatewayRunner:
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info(source=source)
+                            session_info = self._format_session_info()
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -4395,12 +4395,8 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
     
-    def _format_session_info(
-        self,
-        source: Optional[SessionSource] = None,
-        user_config: Optional[dict] = None,
-    ) -> str:
-        """Resolve current/effective session model config and return a formatted info block.
+    def _format_session_info(self) -> str:
+        """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
@@ -4413,7 +4409,6 @@ class GatewayRunner:
         provider = None
         base_url = None
         api_key = None
-        cfg_data: dict = user_config if isinstance(user_config, dict) else {}
 
         try:
             cfg_path = _hermes_home / "config.yaml"
@@ -4421,9 +4416,7 @@ class GatewayRunner:
                 import yaml as _info_yaml
                 with open(cfg_path, encoding="utf-8") as f:
                     data = _info_yaml.safe_load(f) or {}
-                if isinstance(data, dict):
-                    cfg_data = data
-                model_cfg = cfg_data.get("model", {})
+                model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
                     raw_ctx = model_cfg.get("context_length")
                     if raw_ctx is not None:
@@ -4444,24 +4437,6 @@ class GatewayRunner:
             api_key = runtime.get("api_key")
         except Exception:
             pass
-
-        # If a concrete source/thread is known, prefer the effective runtime for
-        # that session so /reset and auto-reset notices reflect topic-specific
-        # model overrides instead of only the global default.
-        if source is not None:
-            try:
-                effective_model, effective_runtime = self._resolve_session_agent_runtime(
-                    source=source,
-                    user_config=cfg_data,
-                )
-                if effective_model:
-                    model = effective_model
-                if isinstance(effective_runtime, dict):
-                    provider = effective_runtime.get("provider") or provider
-                    base_url = effective_runtime.get("base_url") or base_url
-                    api_key = effective_runtime.get("api_key") or api_key
-            except Exception:
-                pass
 
         context_length = get_model_context_length(
             model,
@@ -4574,7 +4549,7 @@ class GatewayRunner:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info(source=source)
+            session_info = self._format_session_info()
         except Exception:
             session_info = ""
 

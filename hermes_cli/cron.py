@@ -41,8 +41,18 @@ def _cron_api(**kwargs):
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
+    from hermes_cli.config import load_config
 
     jobs = list_jobs(include_disabled=show_all)
+    config = load_config() or {}
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    default_model = ""
+    default_provider = ""
+    if isinstance(model_cfg, dict):
+        default_model = str(model_cfg.get("default") or "").strip()
+        default_provider = str(model_cfg.get("provider") or "").strip()
+    elif isinstance(model_cfg, str):
+        default_model = model_cfg.strip()
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -73,6 +83,8 @@ def cron_list(show_all: bool = False):
         deliver_str = ", ".join(deliver)
 
         skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
+        job_model = str(job.get("model") or default_model or "").strip()
+        job_provider = str(job.get("provider") or default_provider or "").strip()
         if state == "paused":
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
@@ -88,6 +100,10 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        if job_model:
+            print(f"    Model:     {job_model}")
+        if job_provider:
+            print(f"    Provider:  {job_provider}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")

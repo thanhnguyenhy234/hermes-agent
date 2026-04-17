@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
+from gateway.model_reply import append_model_reply_suffix, build_model_markdown_lines
 
 logger = logging.getLogger(__name__)
 
@@ -622,6 +623,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     prompt = _build_job_prompt(job)
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    resolved_model = job.get("model") or None
+    resolved_provider = job.get("provider") or None
+    show_model_info = False
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -665,6 +669,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
+                _cron_cfg = _cfg.get("cron", {}) or {}
+                if isinstance(_cron_cfg, dict):
+                    show_model_info = bool(_cron_cfg.get("show_model_info", False))
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -736,6 +743,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 "args": list(runtime.get("args") or []),
             },
         )
+        resolved_model = turn_route["model"]
+        resolved_provider = turn_route["runtime"].get("provider")
 
         fallback_model = _cfg.get("fallback_providers") or _cfg.get("fallback_model") or None
         credential_pool = None
@@ -859,6 +868,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
 
         final_response = result.get("final_response", "") or ""
+        if show_model_info:
+            final_response = append_model_reply_suffix(
+                final_response,
+                resolved_model,
+                resolved_provider,
+            )
         if _looks_like_agent_failure_text(final_response):
             raise RuntimeError(final_response.strip())
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -867,13 +882,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+        model_block_lines = build_model_markdown_lines(resolved_model, resolved_provider) if show_model_info else []
+        model_block = "\n".join(model_block_lines)
+        if model_block:
+            model_block = model_block + "\n"
         
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
-
+{model_block}
 ## Prompt
 
 {prompt}
@@ -890,12 +909,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
+        model_block_lines = build_model_markdown_lines(resolved_model, resolved_provider) if show_model_info else []
+        model_block = "\n".join(model_block_lines)
+        if model_block:
+            model_block = model_block + "\n"
+
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
-
+{model_block}
 ## Prompt
 
 {prompt}

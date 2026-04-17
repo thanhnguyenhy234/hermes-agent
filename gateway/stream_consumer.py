@@ -43,6 +43,7 @@ class StreamConsumerConfig:
     edit_interval: float = 1.0
     buffer_threshold: int = 40
     cursor: str = " ▉"
+    final_suffix: str = ""
     buffer_only: bool = False
 
 
@@ -100,6 +101,7 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        self._final_suffix = self.cfg.final_suffix or ""
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -114,6 +116,20 @@ class GatewayStreamConsumer:
     def final_response_sent(self) -> bool:
         """True when the stream consumer delivered the final assistant reply."""
         return self._final_response_sent
+
+    def set_final_suffix(self, suffix: str) -> None:
+        self._final_suffix = str(suffix or "")
+
+    def _apply_final_suffix(self, text: str) -> str:
+        cleaned = self._clean_for_display(text)
+        if not cleaned.strip():
+            return cleaned
+        suffix = str(self._final_suffix or "")
+        if not suffix:
+            return cleaned
+        if cleaned.endswith(suffix):
+            return cleaned
+        return cleaned.rstrip() + suffix
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -305,11 +321,12 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
-                if should_edit and self._accumulated:
+                current_text = self._apply_final_suffix(self._accumulated) if got_done else self._accumulated
+                if should_edit and current_text:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
-                        len(self._accumulated) > _safe_limit
+                        len(current_text) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -318,7 +335,7 @@ class GatewayStreamConsumer:
                         # proper word/code-fence boundaries and chunk
                         # indicators like "(1/2)".
                         chunks = self.adapter.truncate_message(
-                            self._accumulated, _safe_limit
+                            current_text, _safe_limit
                         )
                         for chunk in chunks:
                             await self._send_new_chunk(chunk, self._message_id)
@@ -337,14 +354,14 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        len(self._accumulated) > _safe_limit
+                        len(current_text) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
                         split_at = self._accumulated.rfind("\n", 0, _safe_limit)
                         if split_at < _safe_limit // 2:
                             split_at = _safe_limit
-                        chunk = self._accumulated[:split_at]
+                        chunk = current_text[:split_at]
                         ok = await self._send_or_edit(chunk)
                         if self._fallback_final_send or not ok:
                             # Edit failed (or backed off due to flood control)
@@ -353,11 +370,11 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        current_text = current_text[split_at:].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
 
-                    display_text = self._accumulated
+                    display_text = current_text
                     if not got_done and not got_segment_break and commentary_text is None:
                         display_text += self.cfg.cursor
 
@@ -369,15 +386,15 @@ class GatewayStreamConsumer:
                     # mid-stream, send a single continuation/fallback message
                     # here instead of letting the base gateway path send the
                     # full response again.
-                    if self._accumulated:
+                    if current_text:
                         if self._fallback_final_send:
                             await self._send_fallback_final(self._accumulated)
-                        elif current_update_visible:
+                        elif current_update_visible and current_text == self._last_sent_text:
                             self._final_response_sent = True
                         elif self._message_id:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(current_text)
                         elif not self._already_sent:
-                            self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            self._final_response_sent = await self._send_or_edit(current_text)
                     return
 
                 if commentary_text is not None:
@@ -514,7 +531,7 @@ class GatewayStreamConsumer:
 
         Retries each chunk once on flood-control failures with a short delay.
         """
-        final_text = self._clean_for_display(text)
+        final_text = self._apply_final_suffix(text)
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
         if not continuation.strip():

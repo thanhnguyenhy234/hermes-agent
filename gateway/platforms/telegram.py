@@ -8,12 +8,15 @@ Uses python-telegram-bot library for:
 """
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import html as _html
 import re
 from typing import Dict, List, Optional, Any
+
+from types import SimpleNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +173,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
+        # Prefix-based topic reroutes, e.g. "nhac toi ..." -> Task topic.
+        self._prefix_topic_routes: List[Dict[str, Any]] = self._load_prefix_topic_routes()
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -2204,6 +2209,75 @@ class TelegramAdapter(BasePlatformAdapter):
         cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
         return cleaned or text
 
+    def _load_prefix_topic_routes(self) -> List[Dict[str, Any]]:
+        raw_routes = self.config.extra.get("prefix_topic_routes", []) if getattr(self.config, "extra", None) else []
+        if not isinstance(raw_routes, list):
+            return []
+
+        routes: List[Dict[str, Any]] = []
+        for entry in raw_routes:
+            if not isinstance(entry, dict):
+                continue
+            prefix = str(entry.get("prefix") or "").strip()
+            if not prefix:
+                continue
+            thread_id = entry.get("thread_id")
+            if thread_id in (None, ""):
+                continue
+            routes.append({
+                "prefix": prefix,
+                "prefix_lower": prefix.lower(),
+                "chat_id": str(entry.get("chat_id") or "").strip() or None,
+                "thread_id": str(thread_id),
+                "topic_name": str(entry.get("topic_name") or "").strip() or None,
+                "strip_prefix": bool(entry.get("strip_prefix", True)),
+            })
+        return routes
+
+    def _match_prefix_topic_route(self, message: Message) -> Optional[Dict[str, Any]]:
+        text = (getattr(message, "text", None) or "").strip()
+        if not text:
+            return None
+
+        chat_id = str(getattr(getattr(message, "chat", None), "id", "") or "").strip()
+        text_lower = text.lower()
+        for route in self._prefix_topic_routes:
+            route_chat_id = route.get("chat_id")
+            if route_chat_id and route_chat_id != chat_id:
+                continue
+            prefix_lower = route.get("prefix_lower") or ""
+            if not prefix_lower:
+                continue
+            if text_lower == prefix_lower or text_lower.startswith(prefix_lower + " "):
+                matched = dict(route)
+                stripped_text = text[len(route["prefix"]):].lstrip() if route.get("strip_prefix", True) else text
+                matched["routed_text"] = stripped_text or text
+                return matched
+        return None
+
+    def _reroute_message_to_topic(self, message: Message, route: Dict[str, Any]) -> Message:
+        """Build a lightweight rerouted message without mutating Telegram's Message object."""
+        rerouted = SimpleNamespace(**getattr(message, "__dict__", {}))
+        rerouted.message_thread_id = int(route["thread_id"])
+        rerouted.text = route.get("routed_text") or getattr(message, "text", None) or ""
+        rerouted.caption = getattr(message, "caption", None)
+        rerouted.message_id = getattr(message, "message_id", None)
+        rerouted.date = getattr(message, "date", None)
+        rerouted.from_user = getattr(message, "from_user", None)
+
+        if getattr(message, "chat", None) is not None:
+            rerouted.chat = copy.copy(message.chat)
+
+        if getattr(message, "reply_to_message", None):
+            rerouted.reply_to_message = copy.copy(message.reply_to_message)
+        else:
+            rerouted.reply_to_message = None
+
+        if route.get("topic_name") and (not getattr(rerouted, "forum_topic_created", None)):
+            rerouted.forum_topic_created = SimpleNamespace(name=route["topic_name"])
+
+        return rerouted
+
     def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
         """Apply Telegram group trigger rules.
 
@@ -2247,7 +2321,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(update.message):
             return
 
-        event = self._build_message_event(update.message, MessageType.TEXT)
+        route = self._match_prefix_topic_route(update.message)
+        source_message = self._reroute_message_to_topic(update.message, route) if route else update.message
+
+        event = self._build_message_event(source_message, MessageType.TEXT)
         event.text = self._clean_bot_trigger_text(event.text)
         self._enqueue_text_event(event)
     
