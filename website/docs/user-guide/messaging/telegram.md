@@ -172,6 +172,27 @@ fly deploy
 
 The gateway log should show: `[telegram] Connected to Telegram (webhook mode)`.
 
+## Proxy Support
+
+If Telegram's API is blocked or you need to route traffic through a proxy, set a Telegram-specific proxy URL. This takes priority over the generic `HTTPS_PROXY` / `HTTP_PROXY` env vars.
+
+**Option 1: config.yaml (recommended)**
+
+```yaml
+telegram:
+  proxy_url: "socks5://127.0.0.1:1080"
+```
+
+**Option 2: environment variable**
+
+```bash
+TELEGRAM_PROXY=socks5://127.0.0.1:1080
+```
+
+Supported schemes: `http://`, `https://`, `socks5://`.
+
+The proxy applies to both the main Telegram connection and the fallback IP transport. If no Telegram-specific proxy is set, the gateway falls back to `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` (or macOS system proxy auto-detection).
+
 ## Home Channel
 
 Use the `/sethome` command in any Telegram chat (DM or group) to designate it as the **home channel**. Scheduled tasks (cron jobs) deliver their results to this channel.
@@ -229,6 +250,7 @@ Hermes Agent works in Telegram group chats with a few considerations:
   - replies to one of the bot's messages
   - `@botusername` mentions
   - matches for one of your configured regex wake words in `telegram.mention_patterns`
+- Use `telegram.ignored_threads` to keep Hermes silent in specific Telegram forum topics, even when the group would otherwise allow free responses or mention-triggered replies
 - If `telegram.require_mention` is left unset or false, Hermes keeps the previous open-group behavior and responds to normal group messages it can see
 
 ### Example group trigger configuration
@@ -241,10 +263,13 @@ telegram:
   mention_patterns:
     - "^\\s*chompy\\b"
   ignored_threads:
+    - 31
+    - "42"
     - "-1001234567890:5"
 ```
 
-This example allows all the usual direct triggers plus messages that begin with `chompy`, even if they do not use an `@mention`. It also silences topic `5` inside supergroup `-1001234567890` completely.
+This example allows all the usual direct triggers plus messages that begin with `chompy`, even if they do not use an `@mention`.
+Messages in Telegram topics `31`, `42`, and topic `5` inside supergroup `-1001234567890` are always ignored before the mention and free-response checks run.
 
 ### Notes on `mention_patterns`
 
@@ -256,18 +281,20 @@ This example allows all the usual direct triggers plus messages that begin with 
 
 #### `telegram.ignored_threads`
 
-**Type:** string or list — **Default:** `[]`
+**Type:** string, integer, or list — **Default:** `[]`
 
-Topic threads where Hermes should **never** respond, even when directly `@mentioned`, replied to, or invoked with a slash command. Each entry uses the format `chat_id:thread_id`.
+Topic threads where Hermes should **never** respond, even when directly `@mentioned`, replied to, or invoked with a slash command. Each entry may be either a bare `thread_id` (applies to the current Telegram chat) or an explicit `chat_id:thread_id` pair when you want to target a specific supergroup/forum.
 
 ```yaml
 # String format
 telegram:
-  ignored_threads: "-1001234567890:5,-1001234567890:12"
+  ignored_threads: "31,-1001234567890:5,-1001234567890:12"
 
 # List format
 telegram:
   ignored_threads:
+    - 31
+    - "42"
     - "-1001234567890:5"
     - "-1001234567890:12"
 ```
@@ -548,6 +575,29 @@ Unlike Discord (where reactions are additive), Telegram's Bot API replaces all b
 :::tip
 If the bot doesn't have permission to add reactions in a group, the reaction calls fail silently and message processing continues normally.
 :::
+
+## Per-Channel Prompts
+
+Assign ephemeral system prompts to specific Telegram groups or forum topics. The prompt is injected at runtime on every turn — never persisted to transcript history — so changes take effect immediately.
+
+```yaml
+telegram:
+  channel_prompts:
+    "-1001234567890": |
+      You are a research assistant. Focus on academic sources,
+      citations, and concise synthesis.
+    "42":  |
+      This topic is for creative writing feedback. Be warm and
+      constructive.
+```
+
+Keys are chat IDs (groups/supergroups) or forum topic IDs. For forum groups, topic-level prompts override the group-level prompt:
+
+- Message in topic `42` inside group `-1001234567890` → uses topic `42`'s prompt
+- Message in topic `99` (no explicit entry) → falls back to group `-1001234567890`'s prompt
+- Message in a group with no entry → no channel prompt applied
+
+Numeric YAML keys are automatically normalized to strings.
 
 ## Troubleshooting
 

@@ -235,6 +235,7 @@ class VoiceReceiver:
         # Calculate dynamic RTP header size (RFC 9335 / rtpsize mode)
         cc = first_byte & 0x0F  # CSRC count
         has_extension = bool(first_byte & 0x10)  # extension bit
+        has_padding = bool(first_byte & 0x20)  # padding bit (RFC 3550 §5.1)
         header_size = 12 + (4 * cc) + (4 if has_extension else 0)
 
         if len(data) < header_size + 4:  # need at least header + nonce
@@ -277,6 +278,31 @@ class VoiceReceiver:
         # Skip encrypted extension data to get the actual opus payload
         if ext_data_len and len(decrypted) > ext_data_len:
             decrypted = decrypted[ext_data_len:]
+
+        # --- Strip RTP padding (RFC 3550 §5.1) ---
+        # When the P bit is set, the last payload byte holds the count of
+        # trailing padding bytes (including itself) that must be removed
+        # before further processing. Skipping this passes padding-contaminated
+        # bytes into DAVE/Opus and corrupts inbound audio.
+        if has_padding:
+            if not decrypted:
+                if self._packet_debug_count <= 10:
+                    logger.warning(
+                        "RTP padding bit set but no payload (ssrc=%d)", ssrc,
+                    )
+                return
+            pad_len = decrypted[-1]
+            if pad_len == 0 or pad_len > len(decrypted):
+                if self._packet_debug_count <= 10:
+                    logger.warning(
+                        "Invalid RTP padding length %d for payload size %d (ssrc=%d)",
+                        pad_len, len(decrypted), ssrc,
+                    )
+                return
+            decrypted = decrypted[:-pad_len]
+            if not decrypted:
+                # Padding consumed entire payload — nothing to decode
+                return
 
         # --- DAVE E2EE decrypt ---
         if self._dave_session:
@@ -1992,11 +2018,14 @@ class DiscordAdapter(BasePlatformAdapter):
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
+        channel_id = str(interaction.channel_id)
+        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
             source=source,
             raw_message=interaction,
+            channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
 
     # ------------------------------------------------------------------
@@ -2067,14 +2096,17 @@ class DiscordAdapter(BasePlatformAdapter):
             chat_topic=chat_topic,
         )
 
-        _parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
+        _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
+        _parent_id = str(getattr(_parent_channel, "id", "") or "")
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
+        _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=interaction,
             auto_skill=_skills,
+            channel_prompt=_channel_prompt,
         )
         await self.handle_message(event)
 
@@ -2102,6 +2134,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 if isinstance(skills, list) and skills:
                     return list(dict.fromkeys(skills))  # dedup, preserve order
         return None
+
+    def _resolve_channel_prompt(self, channel_id: str, parent_id: str | None = None) -> str | None:
+        """Resolve a Discord per-channel prompt, preferring the exact channel over its parent."""
+        from gateway.platforms.base import resolve_channel_prompt
+        return resolve_channel_prompt(self.config.extra, channel_id, parent_id)
 
     def _thread_parent_channel(self, channel: Any) -> Any:
         """Return the parent text channel when invoked from a thread."""
@@ -2654,6 +2691,7 @@ class DiscordAdapter(BasePlatformAdapter):
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
+        _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 
         reply_to_id = None
         reply_to_text = None
@@ -2674,6 +2712,7 @@ class DiscordAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=message.created_at,
             auto_skill=_skills,
+            channel_prompt=_channel_prompt,
         )
 
         # Track thread participation so the bot won't require @mention for
