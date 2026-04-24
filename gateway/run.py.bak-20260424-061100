@@ -930,61 +930,6 @@ class GatewayRunner:
 
         return [entry for entry in candidates if isinstance(entry, dict)]
 
-    @staticmethod
-    def _topic_model_direct_chats(user_config: Optional[dict]) -> list[dict]:
-        if not isinstance(user_config, dict):
-            return []
-
-        candidates: list = []
-        platforms_cfg = user_config.get("platforms", {})
-        if isinstance(platforms_cfg, dict):
-            telegram_cfg = platforms_cfg.get("telegram", {})
-            if isinstance(telegram_cfg, dict):
-                extra_cfg = telegram_cfg.get("extra", {})
-                if isinstance(extra_cfg, dict) and isinstance(extra_cfg.get("direct_chats"), list):
-                    candidates.extend(extra_cfg.get("direct_chats") or [])
-
-        legacy_telegram_cfg = user_config.get("telegram", {})
-        if isinstance(legacy_telegram_cfg, dict):
-            extra_cfg = legacy_telegram_cfg.get("extra", {})
-            if isinstance(extra_cfg, dict) and isinstance(extra_cfg.get("direct_chats"), list):
-                candidates.extend(extra_cfg.get("direct_chats") or [])
-
-        return [entry for entry in candidates if isinstance(entry, dict)]
-
-    @staticmethod
-    def _build_source_model_override_entry(entry: Optional[dict]) -> Optional[dict]:
-        if not isinstance(entry, dict):
-            return None
-
-        topic_override: dict = {}
-        for key in ("model", "provider", "base_url", "api_key", "api_mode"):
-            value = entry.get(key)
-            if isinstance(value, str):
-                value = value.strip()
-            if value not in (None, ""):
-                topic_override[key] = value
-
-        api_key_env = str(entry.get("api_key_env") or "").strip()
-        if api_key_env and not topic_override.get("api_key"):
-            env_value = os.getenv(api_key_env, "").strip()
-            if env_value:
-                topic_override["api_key"] = env_value
-
-        if not topic_override.get("model"):
-            return None
-
-        route_name = str(
-            entry.get("name")
-            or entry.get("chat_id")
-            or entry.get("user_id")
-            or entry.get("thread_id")
-            or ""
-        ).strip()
-        topic_override["__topic_name__"] = route_name
-        topic_override["__topic_model_locked__"] = not bool(entry.get("allow_smart_model_routing", False))
-        return topic_override
-
     def _resolve_source_topic_model_override(
         self,
         source: Optional[SessionSource],
@@ -996,38 +941,16 @@ class GatewayRunner:
         platform_name = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
         if str(platform_name).strip().lower() != "telegram":
             return None
-        if not source.chat_id:
+        if not source.chat_id or not source.thread_id:
             return None
 
         chat_id = str(source.chat_id).strip()
-        if not chat_id:
-            return None
-
-        chat_type = str(getattr(source, "chat_type", "") or "").strip().lower()
-        if chat_type in {"dm", "private"}:
-            user_id = str(getattr(source, "user_id", "") or "").strip()
-            for entry in self._topic_model_direct_chats(user_config):
-                entry_chat_id = str(entry.get("chat_id", "") or "").strip()
-                entry_user_id = str(entry.get("user_id", "") or "").strip()
-                if entry_chat_id and entry_chat_id != chat_id:
-                    continue
-                if entry_user_id and user_id and entry_user_id != user_id:
-                    continue
-                if not entry_chat_id and not entry_user_id:
-                    continue
-                direct_override = self._build_source_model_override_entry(entry)
-                if direct_override:
-                    return direct_override
-
-        if not source.thread_id:
-            return None
-
         thread_id = str(source.thread_id).strip()
-        if not thread_id:
+        if not chat_id or not thread_id:
             return None
 
         for chat_entry in self._topic_model_group_topics(user_config):
-            entry_chat_id = str(chat_entry.get("chat_id", "") or "").strip()
+            entry_chat_id = str(chat_entry.get("chat_id", "")).strip()
             if entry_chat_id != chat_id:
                 continue
             topics = chat_entry.get("topics", [])
@@ -1036,12 +959,30 @@ class GatewayRunner:
             for topic in topics:
                 if not isinstance(topic, dict):
                     continue
-                entry_thread_id = str(topic.get("thread_id", "") or "").strip()
+                entry_thread_id = str(topic.get("thread_id", "")).strip()
                 if entry_thread_id != thread_id:
                     continue
-                topic_override = self._build_source_model_override_entry(topic)
-                if topic_override:
-                    return topic_override
+
+                topic_override: dict = {}
+                for key in ("model", "provider", "base_url", "api_key", "api_mode"):
+                    value = topic.get(key)
+                    if isinstance(value, str):
+                        value = value.strip()
+                    if value not in (None, ""):
+                        topic_override[key] = value
+
+                api_key_env = str(topic.get("api_key_env") or "").strip()
+                if api_key_env and not topic_override.get("api_key"):
+                    env_value = os.getenv(api_key_env, "").strip()
+                    if env_value:
+                        topic_override["api_key"] = env_value
+
+                if not topic_override.get("model"):
+                    return None
+
+                topic_override["__topic_name__"] = str(topic.get("name") or "").strip()
+                topic_override["__topic_model_locked__"] = not bool(topic.get("allow_smart_model_routing", False))
+                return topic_override
 
         return None
 
