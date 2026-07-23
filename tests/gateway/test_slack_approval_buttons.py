@@ -1,7 +1,6 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
-import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,8 +42,8 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from gateway.platforms.slack import SlackAdapter
-from gateway.config import Platform, PlatformConfig
+from plugins.platforms.slack.adapter import SlackAdapter
+from gateway.config import PlatformConfig, Platform
 
 
 def _make_adapter():
@@ -57,6 +56,25 @@ def _make_adapter():
     adapter._team_bot_user_ids = {"T1": "U_BOT"}
     adapter._channel_team = {"C1": "T1"}
     return adapter
+
+
+class _AuthRunner:
+    def __init__(self, auth_fn=None):
+        self._auth_fn = auth_fn or (lambda _source: True)
+        self.seen_sources = []
+
+    async def handle(self, event):
+        return None
+
+    def _is_user_authorized(self, source):
+        self.seen_sources.append(source)
+        return self._auth_fn(source)
+
+
+def _attach_auth_runner(adapter, auth_fn=None):
+    runner = _AuthRunner(auth_fn=auth_fn)
+    adapter.set_message_handler(runner.handle)
+    return runner
 
 
 # ===========================================================================
@@ -102,6 +120,24 @@ class TestSlackExecApproval:
         # Each button carries the session key as value
         for e in elements:
             assert e["value"] == "agent:main:slack:group:C1:1111"
+
+    @pytest.mark.asyncio
+    async def test_smart_deny_owner_override_hides_persistent_buttons(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1", command="rm -rf /", session_key="s",
+            allow_permanent=False, smart_denied=True,
+        )
+
+        kwargs = mock_client.chat_postMessage.call_args.kwargs
+        elements = kwargs["blocks"][1]["elements"]
+        assert [element["action_id"] for element in elements] == [
+            "hermes_approve_once", "hermes_deny",
+        ]
+        assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
     @pytest.mark.asyncio
     async def test_sends_in_thread(self):
@@ -155,6 +191,7 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_resolves_approval(self):
         adapter = _make_adapter()
+        _attach_auth_runner(adapter)
         adapter._approval_resolved["1234.5678"] = False
 
         ack = AsyncMock()
@@ -167,7 +204,7 @@ class TestSlackApprovalAction:
                 ],
             },
             "channel": {"id": "C1"},
-            "user": {"name": "norbert"},
+            "user": {"name": "norbert", "id": "U_NORBERT"},
         }
         action = {
             "action_id": "hermes_approve_once",
@@ -191,13 +228,14 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_prevents_double_click(self):
         adapter = _make_adapter()
+        _attach_auth_runner(adapter)
         adapter._approval_resolved["1234.5678"] = True  # Already resolved
 
         ack = AsyncMock()
         body = {
             "message": {"ts": "1234.5678", "blocks": []},
             "channel": {"id": "C1"},
-            "user": {"name": "norbert"},
+            "user": {"name": "norbert", "id": "U_NORBERT"},
         }
         action = {
             "action_id": "hermes_approve_once",
@@ -214,6 +252,7 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_deny_action(self):
         adapter = _make_adapter()
+        _attach_auth_runner(adapter)
         adapter._approval_resolved["1.2"] = False
 
         ack = AsyncMock()
@@ -222,7 +261,7 @@ class TestSlackApprovalAction:
                 {"type": "section", "text": {"type": "mrkdwn", "text": "cmd"}},
             ]},
             "channel": {"id": "C1"},
-            "user": {"name": "alice"},
+            "user": {"name": "alice", "id": "U_ALICE"},
         }
         action = {"action_id": "hermes_deny", "value": "session-key"}
 
@@ -235,6 +274,206 @@ class TestSlackApprovalAction:
         mock_resolve.assert_called_once_with("session-key", "deny")
         update_kwargs = mock_client.chat_update.call_args[1]
         assert "Denied by alice" in update_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_truncates_inflated_original_text(self):
+        """Interaction payload re-escapes HTML entities; text must be capped."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1.2"] = False
+
+        # Simulate Slack re-escaping: original was ~2990 chars, but & → &amp;
+        # etc. inflates it past 3000.
+        inflated_text = "a" * 2990 + "&amp;" * 10  # 2990 + 50 = 3040 chars
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1.2", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": inflated_text}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U_ALICE"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            await adapter._handle_approval_action(ack, body, action)
+
+        update_kwargs = mock_client.chat_update.call_args[1]
+        section_text = update_kwargs["blocks"][0]["text"]["text"]
+        assert len(section_text) <= 3000
+
+    @pytest.mark.asyncio
+    async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
+        adapter = _make_adapter()
+        adapter._approval_resolved["1234.5678"] = False
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_ATTACKER"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+
+        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        ack.assert_called_once()
+        mock_resolve.assert_not_called()
+
+
+class TestSlackInteractiveAuth:
+    def test_delegates_to_gateway_runner_auth(self):
+        adapter = _make_adapter()
+        runner = _attach_auth_runner(adapter, auth_fn=lambda source: source.user_id == "U_OK")
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OK",
+            channel_id="C1",
+            user_name="operator",
+        ) is True
+        assert adapter._is_interactive_user_authorized(
+            "U_BAD",
+            channel_id="C1",
+            user_name="intruder",
+        ) is False
+
+        assert len(runner.seen_sources) == 2
+        assert runner.seen_sources[0].platform == Platform.SLACK
+        assert runner.seen_sources[0].chat_id == "C1"
+        assert runner.seen_sources[0].chat_type == "group"
+
+    def test_passes_workspace_scope_to_gateway_runner_auth(self):
+        adapter = _make_adapter()
+        runner = _attach_auth_runner(adapter)
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OK",
+            channel_id="C1",
+            user_name="operator",
+            team_id="T1",
+        ) is True
+        assert runner.seen_sources[0].scope_id == "T1"
+
+
+class TestSlackSlashConfirmAction:
+    @pytest.mark.asyncio
+    async def test_global_allowlist_allows_authorized_click(self, monkeypatch):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock()
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+
+        ack = AsyncMock()
+        body = {
+            "message": {
+                "ts": "2222.3333",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "Original prompt"}},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "agent:main:slack:group:C1:1111|confirm-1",
+        }
+
+        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="follow-up")) as mock_resolve:
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        ack.assert_called_once()
+        mock_resolve.assert_awaited_once_with(
+            "agent:main:slack:group:C1:1111",
+            "confirm-1",
+            "once",
+        )
+        mock_client.chat_update.assert_called_once()
+        mock_client.chat_postMessage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_action_uses_outer_payload_workspace_client(self, monkeypatch):
+        adapter = _make_adapter()
+        secondary_client = AsyncMock()
+        adapter._team_clients["T2"] = secondary_client
+        monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_OWNER")
+
+        ack = AsyncMock()
+        body = {
+            "team_id": "T2",
+            "message": {
+                "ts": "2222.3333",
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": "Original prompt"}},
+                ],
+            },
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "agent:main:slack:group:C1:1111|confirm-1",
+        }
+
+        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="follow-up")):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        secondary_client.chat_update.assert_awaited_once()
+        secondary_client.chat_postMessage.assert_awaited_once()
+        adapter._team_clients["T1"].chat_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_truncates_inflated_original_text(self):
+        """Interaction payload re-escapes HTML entities; text must be capped."""
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["2222.3333"] = False
+
+        # Simulate Slack re-escaping inflating text past 3000 chars.
+        inflated_text = "b" * 2990 + "&lt;" * 10  # 2990 + 40 = 3030 chars
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "2222.3333", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": inflated_text}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "owner", "id": "U_OWNER"},
+        }
+        action = {
+            "action_id": "hermes_confirm_once",
+            "value": "agent:main:slack:group:C1:1111|confirm-1",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postMessage = AsyncMock()
+
+        with patch("tools.slash_confirm.resolve", new=AsyncMock(return_value="ok")):
+            await adapter._handle_slash_confirm_action(ack, body, action)
+
+        update_kwargs = mock_client.chat_update.call_args[1]
+        section_text = update_kwargs["blocks"][0]["text"]["text"]
+        assert len(section_text) <= 3000
 
 
 # ===========================================================================
@@ -257,7 +496,7 @@ class TestSlackThreadContext:
         })
 
         # Mock user name resolution
-        adapter._user_name_cache = {"U1": "Alice", "U2": "Bob"}
+        adapter._user_name_cache = {("T1", "U1"): "Alice", ("T1", "U2"): "Bob"}
 
         context = await adapter._fetch_thread_context(
             channel_id="C1",
@@ -275,24 +514,55 @@ class TestSlackThreadContext:
         assert "<@U_BOT>" not in context
 
     @pytest.mark.asyncio
-    async def test_skips_bot_messages(self):
+    async def test_includes_self_bot_replies_as_assistant_on_cold_start(self):
+        """Cold-start contract (issue #38861): self-bot replies in the thread
+        must be included in the context, labelled with an ``[assistant]``
+        prefix so the agent can reconstruct its own prior turns. This method
+        only runs on the cold-start path (guarded at the call site by
+        ``_has_active_session_for_thread``) — when an active session exists,
+        the session history already carries those replies, so there is no
+        risk of circular duplication.
+
+        Third-party bots (e.g. deploy notifications) must still be kept,
+        attributed to their display name."""
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
         mock_client.conversations_replies = AsyncMock(return_value={
             "messages": [
                 {"ts": "1000.0", "user": "U1", "text": "Parent"},
-                {"ts": "1000.1", "bot_id": "B1", "text": "Bot reply (should be skipped)"},
+                # Self-bot reply -> kept on cold-start, prefixed [assistant]
+                {
+                    "ts": "1000.1",
+                    "bot_id": "B_SELF",
+                    "user": "U_BOT",
+                    "text": "Previous bot self-reply",
+                },
+                # Third-party bot child -> kept (useful context)
+                {
+                    "ts": "1000.15",
+                    "bot_id": "B_OTHER",
+                    "user": "U_OTHER_BOT",
+                    "text": "Deploy succeeded",
+                },
                 {"ts": "1000.2", "user": "U1", "text": "Current"},
             ]
         })
-        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._user_name_cache = {
+            ("T1", "U1"): "Alice",
+            ("T1", "U_OTHER_BOT"): "DeployBot",
+        }
 
         context = await adapter._fetch_thread_context(
             channel_id="C1", thread_ts="1000.0", current_ts="1000.2", team_id="T1"
         )
 
-        assert "Bot reply" not in context
         assert "Alice: Parent" in context
+        # Self-bot reply must now be included with [assistant] label
+        assert "[assistant] Previous bot self-reply" in context
+        # Third-party bot message must still be included
+        assert "Deploy succeeded" in context
+        # The [assistant] label must NOT leak to user messages
+        assert "[assistant] Alice" not in context
 
     @pytest.mark.asyncio
     async def test_empty_thread(self):
@@ -315,6 +585,315 @@ class TestSlackThreadContext:
             channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
         )
         assert context == ""
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_includes_bot_parent(self):
+        """The thread parent posted by a bot (e.g. a cron summary) must be
+        included in the context, prefixed with ``[thread parent]``."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                # Bot-posted parent (cron job)
+                {
+                    "ts": "1000.0",
+                    "bot_id": "B123",
+                    "subtype": "bot_message",
+                    "username": "cron",
+                    "text": "メール要約: 本日の新着3件",
+                },
+                # User reply that triggered the fetch
+                {"ts": "1000.1", "user": "U1", "text": "詳細を教えて"},
+            ]
+        })
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1",
+            thread_ts="1000.0",
+            current_ts="1000.1",  # exclude the trigger message itself
+            team_id="T1",
+        )
+
+        assert "[thread parent]" in context
+        assert "メール要約: 本日の新着3件" in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_extracts_block_kit_parent(self):
+        """Bot-posted parents that put their content in ``blocks`` (Honeycomb,
+        PagerDuty, Datadog, GitHub bot, etc.) used to be reduced to just the
+        ``text`` field — typically only the alert title — which dropped the
+        URL/button payload that makes the alert useful to an agent replying
+        in the thread. The fetched context must now include bounded display
+        text and actionable URLs so section text and button URLs survive."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                # Bot-posted alert: title in `text`, URL only in `blocks`.
+                # Mirrors what Honeycomb, PagerDuty, etc. actually send.
+                {
+                    "ts": "1000.0",
+                    "bot_id": "B_ALERT",
+                    "subtype": "bot_message",
+                    "username": "alertbot",
+                    "text": "low_alerts (checkout)",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "*Trigger fired:* low_alerts",
+                            },
+                        },
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "View graph"},
+                                    "url": "https://example.example/view/abc123",
+                                },
+                            ],
+                        },
+                    ],
+                },
+                # User reply that triggered the fetch.
+                {"ts": "1000.1", "user": "U1", "text": "what's going on?"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1",
+            thread_ts="1000.0",
+            current_ts="1000.1",
+            team_id="T1",
+        )
+
+        # Title still present.
+        assert "low_alerts (checkout)" in context
+        # URL from the action button must now surface.
+        assert "https://example.example/view/abc123" in context
+        # Marked as the thread parent.
+        assert "[thread parent]" in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_includes_blocks_only_parent(self):
+        """A parent message with empty ``text`` but non-empty ``blocks`` must
+        still be included — without this, alerts that put *everything* in
+        ``blocks`` (some webhook integrations do this) are silently dropped
+        because the ``if not msg_text: continue`` guard fires."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "bot_id": "B_ALERT",
+                    "subtype": "bot_message",
+                    "username": "alertbot",
+                    "text": "",
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": "Build failed: <https://example.example/build/9|#9>",
+                            },
+                        },
+                    ],
+                },
+                {"ts": "1000.1", "user": "U1", "text": "looking"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1",
+            thread_ts="1000.0",
+            current_ts="1000.1",
+            team_id="T1",
+        )
+
+        assert "[thread parent]" in context
+        assert "https://example.example/build/9" in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_parent_text_surfaces_block_urls(self):
+        """Cold-cache _fetch_thread_parent_text must use the same renderer as
+        _fetch_thread_context so a bot-posted parent with a URL only in
+        ``blocks`` surfaces it in reply_to_text, not just in thread context."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {
+                    "ts": "1000.0",
+                    "bot_id": "B_ALERT",
+                    "subtype": "bot_message",
+                    "username": "alertbot",
+                    "text": "Incident triggered",
+                    "blocks": [
+                        {
+                            "type": "actions",
+                            "elements": [
+                                {
+                                    "type": "button",
+                                    "text": {"type": "plain_text", "text": "View incident"},
+                                    "url": "https://example.example/incident/42",
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ]
+        })
+
+        text = await adapter._fetch_thread_parent_text(
+            channel_id="C1",
+            thread_ts="1000.0",
+            team_id="T1",
+        )
+
+        assert "Incident triggered" in text
+        assert "https://example.example/incident/42" in text
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_includes_self_bot_replies_with_assistant_label(self):
+        """Cold-start: parent (non-self bot) kept with [thread parent],
+        self-bot child replies kept with [assistant] label, user replies
+        kept unchanged. The cold-start path is the ONLY caller of this
+        method; circular-context risk does not apply here (see #38861)."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "bot_id": "B_CRON", "text": "Cron summary"},
+                # Self-bot child reply -> kept with [assistant] label
+                {
+                    "ts": "1000.1",
+                    "bot_id": "B_SELF",
+                    "user": "U_BOT",  # matches adapter._bot_user_id
+                    "text": "Previous self reply",
+                },
+                # User reply -> kept
+                {"ts": "1000.2", "user": "U1", "text": "Follow-up question"},
+                # Current trigger (excluded by current_ts match)
+                {"ts": "1000.3", "user": "U1", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.3", team_id="T1"
+        )
+
+        assert "Cron summary" in context
+        assert "[thread parent]" in context
+        # Self-bot child reply is now kept with the [assistant] label
+        assert "[assistant] Previous self reply" in context
+        assert "Follow-up question" in context
+        assert "Current" not in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_multi_workspace(self):
+        """Self-bot filtering must use the per-workspace bot user id so a
+        self-bot id that belongs to a different workspace does not accidentally
+        filter out a legitimate message in the current workspace."""
+        adapter = _make_adapter()
+        # Add a second workspace with a different bot user id
+        adapter._team_clients["T2"] = AsyncMock()
+        adapter._team_bot_user_ids = {"T1": "U_BOT_T1", "T2": "U_BOT_T2"}
+        adapter._bot_user_id = "U_BOT_T1"
+        adapter._channel_team["C2"] = "T2"
+
+        mock_client = adapter._team_clients["T2"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "2000.0", "user": "U2", "text": "Parent T2"},
+                # This has the *T1* bot's user id — from T2's perspective this
+                # is a third-party bot, so it must be kept.
+                {
+                    "ts": "2000.1",
+                    "bot_id": "B_FOREIGN",
+                    "user": "U_BOT_T1",
+                    "team": "T2",
+                    "text": "Cross-workspace bot reply",
+                },
+                # Self-bot for T2 — kept with the [assistant] label
+                {
+                    "ts": "2000.2",
+                    "bot_id": "B_SELF_T2",
+                    "user": "U_BOT_T2",
+                    "team": "T2",
+                    "text": "Own T2 bot reply",
+                },
+                {"ts": "2000.3", "user": "U2", "text": "Current"},
+            ]
+        })
+        adapter._user_name_cache = {("T2", "U2"): "Bob"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C2", thread_ts="2000.0", current_ts="2000.3", team_id="T2"
+        )
+
+        assert "Parent T2" in context
+        assert "Cross-workspace bot reply" in context
+        # T2's own self-bot reply is kept with the [assistant] label
+        # (cold-start path includes self-replies; see #38861). The
+        # per-workspace filter still applies: this assertion confirms
+        # we use T2's bot id, not T1's, when deciding what counts as
+        # self-bot.
+        assert "[assistant] Own T2 bot reply" in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_current_ts_excluded(self):
+        """Regression guard: the message whose ts == current_ts must never
+        appear in the context output (it will be delivered as the user
+        message itself)."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Parent"},
+                {"ts": "1000.1", "user": "U1", "text": "DO NOT INCLUDE THIS"},
+            ]
+        })
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+
+        assert "Parent" in context
+        assert "DO NOT INCLUDE THIS" not in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_parent_text_from_cache(self):
+        """_fetch_thread_parent_text should reuse the thread-context cache
+        when it is warm, avoiding an extra conversations.replies call."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "bot_id": "B123", "text": "Parent summary"},
+                {"ts": "1000.1", "user": "U1", "text": "reply"},
+            ]
+        })
+
+        # Warm the cache via _fetch_thread_context
+        await adapter._fetch_thread_context(
+            channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
+        )
+        assert mock_client.conversations_replies.await_count == 1
+
+        parent = await adapter._fetch_thread_parent_text(
+            channel_id="C1", thread_ts="1000.0", team_id="T1"
+        )
+        assert parent == "Parent summary"
+        # No additional API call
+        assert mock_client.conversations_replies.await_count == 1
 
 
 # ===========================================================================
@@ -370,6 +949,34 @@ class TestSessionKeyFix:
         result = adapter._has_active_session_for_thread(
             channel_id="C1", thread_ts="1000.0", user_id="U123"
         )
+        assert result is False
+
+    def test_stale_session_returns_false(self):
+        """A session key that exists but would be rolled by the reset policy
+        must NOT count as active — otherwise the reset-time first turn skips
+        the thread-history reseed (#55239)."""
+        adapter = _make_adapter()
+
+        class Store:
+            config = MagicMock()
+            config.group_sessions_per_user = False
+            config.thread_sessions_per_user = False
+            _entries = {
+                "agent:main:slack:group:C1:1000.0": MagicMock()
+            }
+
+            def _ensure_loaded(self):
+                return None
+
+            def _should_reset(self, entry, source):
+                return "idle"
+
+        adapter._session_store = Store()
+
+        result = adapter._has_active_session_for_thread(
+            channel_id="C1", thread_ts="1000.0", user_id="U123"
+        )
+
         assert result is False
 
 
