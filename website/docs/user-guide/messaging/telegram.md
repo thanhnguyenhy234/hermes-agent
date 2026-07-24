@@ -532,6 +532,7 @@ Hermes Agent works in Telegram group chats with a few considerations:
 - **Privacy mode** determines what messages the bot can see (see [Step 3](#step-3-privacy-mode-critical-for-groups))
 - `TELEGRAM_ALLOWED_USERS` still applies — only authorized users can trigger the bot, even in groups
 - You can keep the bot from responding to ordinary group chatter with `telegram.require_mention: true`
+- You can silence specific topic threads entirely with `telegram.ignored_threads`
 - With `telegram.require_mention: true`, group messages are accepted when they are:
   - replies to one of the bot's messages
   - `@botusername` mentions
@@ -612,10 +613,11 @@ telegram:
   ignored_threads:
     - 31
     - "42"
+    - "-1001234567890:5"
 ```
 
 This example allows all the usual direct triggers plus messages that begin with `chompy`, even if they do not use an `@mention`.
-Messages in Telegram topics `31` and `42` are always ignored before the mention and free-response checks run.
+Messages in Telegram topics `31`, `42`, and topic `5` inside supergroup `-1001234567890` are always ignored before the mention and free-response checks run.
 
 ### Notes on `mention_patterns`
 
@@ -624,6 +626,28 @@ Messages in Telegram topics `31` and `42` are always ignored before the mention 
 - Patterns are checked against both text messages and media captions
 - Invalid regex patterns are ignored with a warning in the gateway logs rather than crashing the bot
 - If you want a pattern to match only at the start of a message, anchor it with `^`
+
+#### `telegram.ignored_threads`
+
+**Type:** string, integer, or list — **Default:** `[]`
+
+Topic threads where Hermes should **never** respond, even when directly `@mentioned`, replied to, or invoked with a slash command. Each entry may be either a bare `thread_id` (applies to the current Telegram chat) or an explicit `chat_id:thread_id` pair when you want to target a specific supergroup/forum.
+
+```yaml
+# String format
+telegram:
+  ignored_threads: "31,-1001234567890:5,-1001234567890:12"
+
+# List format
+telegram:
+  ignored_threads:
+    - 31
+    - "42"
+    - "-1001234567890:5"
+    - "-1001234567890:12"
+```
+
+This is useful when you want Hermes active in a forum-enabled supergroup overall, but want certain topics (for example `Announcements` or `Archive`) to stay bot-free. The ignore check has the highest priority — if a message arrives in one of these threads, Hermes drops it before mention rules or command handling run.
 
 ## Private Chat Topics (Bot API 9.4)
 
