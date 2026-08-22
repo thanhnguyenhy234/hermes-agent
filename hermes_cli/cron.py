@@ -99,8 +99,18 @@ def _warn_if_gateway_not_running() -> None:
 def cron_list(show_all: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
+    from hermes_cli.config import load_config
 
     jobs = list_jobs(include_disabled=show_all)
+    config = load_config() or {}
+    model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+    default_model = ""
+    default_provider = ""
+    if isinstance(model_cfg, dict):
+        default_model = str(model_cfg.get("default") or "").strip()
+        default_provider = str(model_cfg.get("provider") or "").strip()
+    elif isinstance(model_cfg, str):
+        default_model = model_cfg.strip()
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -142,6 +152,8 @@ def cron_list(show_all: bool = False):
         deliver_str = ", ".join(deliver)
 
         skills = job.get("skills") or ([job["skill"]] if job.get("skill") else [])
+        job_model = str(job.get("model") or default_model or "").strip()
+        job_provider = str(job.get("provider") or default_provider or "").strip()
         if state == "paused":
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
@@ -157,6 +169,10 @@ def cron_list(show_all: bool = False):
         print(f"    Repeat:    {repeat_str}")
         print(f"    Next run:  {next_run}")
         print(f"    Deliver:   {deliver_str}")
+        if job_model:
+            print(f"    Model:     {job_model}")
+        if job_provider:
+            print(f"    Provider:  {job_provider}")
         if skills:
             print(f"    Skills:    {', '.join(skills)}")
         script = job.get("script")
@@ -182,9 +198,6 @@ def cron_list(show_all: bool = False):
                 status_display = color("ok", Colors.GREEN)
             else:
                 status_display = color(f"{last_status}: {job.get('last_error', '?')}", Colors.RED)
-                streak = int(job.get("failure_streak") or 0)
-                if streak >= 2:
-                    status_display += color(f"  ({streak} failures in a row)", Colors.RED)
             print(f"    Last run:  {last_run}  {status_display}")
 
         latest_execution = job.get("latest_execution")
@@ -198,13 +211,6 @@ def cron_list(show_all: bool = False):
         if delivery_err:
             print(f"    {color('⚠ Delivery failed:', Colors.YELLOW)} {delivery_err}")
 
-        fire_err = job.get("last_fire_error")
-        if isinstance(fire_err, dict) and fire_err.get("detail"):
-            print(
-                f"    {color('⚠ Missed scheduled fire:', Colors.RED)} "
-                f"{fire_err.get('at', '?')}  {fire_err['detail']}"
-            )
-
         print()
 
     _warn_if_gateway_not_running()
@@ -213,17 +219,7 @@ def cron_list(show_all: bool = False):
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import tick
-    try:
-        tick(verbose=True)
-    except OSError as exc:
-        # tick() now propagates real lock-acquisition failures (EMFILE,
-        # EACCES on open, ...) instead of swallowing them as contention
-        # (#87644). For the one-shot CLI surface, report cleanly instead of
-        # dumping a traceback; the gateway ticker loop handles its own retry.
-        print(color(f"✗ Cron tick failed: {exc}", Colors.RED))
-        print("  Check `hermes cron status` and the gateway log for details.")
-        return 1
-    return 0
+    tick(verbose=True)
 
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
@@ -288,7 +284,6 @@ def cron_status():
             get_ticker_success_age,
             TICKER_INTERVAL_SECONDS,
         )
-        from cron.scheduler import _is_fd_exhaustion_text as _cron_is_fd_exhaustion_text
 
         # Allow ~3 missed ticker iterations (+ a little slack) before declaring
         # trouble. Derived from the shared interval constant so this threshold
@@ -319,9 +314,7 @@ def cron_status():
             if last_error:
                 # Show WHY ticks fail — e.g. a root-rewritten jobs.json
                 # (PermissionError) that silently locked out the ticker's
-                # uid for ~14h in the field (#68483), or fd exhaustion
-                # (EMFILE) that used to stall the scheduler invisibly
-                # (#87644).
+                # uid for ~14h in the field (#68483).
                 print(color(f"  Last tick error: {last_error}", Colors.RED))
                 if "Permission denied" in last_error:
                     print(color(
@@ -329,14 +322,6 @@ def cron_status():
                         "(e.g. rewritten by a root `docker exec hermes "
                         "hermes cron ...`). Fix ownership to match the "
                         "gateway user, and prefer `docker exec -u <uid>:<gid>`.",
-                        Colors.YELLOW,
-                    ))
-                elif _cron_is_fd_exhaustion_text(last_error):
-                    print(color(
-                        "  Hint: the ticker hit file-descriptor exhaustion "
-                        "(EMFILE). The scheduler now retries with backoff and "
-                        "attempts fd reclamation, but if the leak persists, "
-                        "restart the gateway to recover scheduling.",
                         Colors.YELLOW,
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
@@ -395,8 +380,6 @@ def cron_create(args):
         no_agent=getattr(args, "no_agent", False) or None,
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
-        continuity=getattr(args, "continuity", None),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -415,8 +398,6 @@ def cron_create(args):
         print(f"  Monitor: {job_data['monitor_url']} (agent runs only on output change)")
     if job_data.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
-    if job_data.get("continuity"):
-        print("  Continuity: on (each run sees the previous run's output)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
     print(f"  Next run: {result['next_run_at']}")
@@ -470,8 +451,6 @@ def cron_edit(args):
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
-        continuity=getattr(args, "continuity", None),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -493,40 +472,13 @@ def cron_edit(args):
         print(f"  Monitor: {updated['monitor_url']} (agent runs only on output change)")
     if updated.get("no_agent"):
         print("  Mode: no-agent (script stdout delivered directly)")
-    if updated.get("continuity"):
-        print("  Continuity: on (each run sees the previous run's output)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
     return 0
 
 
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
-    _stateless_reset = None
-    if action == "run":
-        # One-shot CLI: this process exits as soon as the command returns, so
-        # a background-dispatched run (daemon thread of THIS process) would be
-        # orphaned mid-LLM-call — the delegation dies 'unknown' and the job's
-        # execution row is stuck 'claimed', blocking future runs (#86721).
-        # The background path in ``_try_dispatch_background_run`` triggers when
-        # the CLI inherits a gateway/desktop session env (HERMES_SESSION_KEY);
-        # declare the channel stateless so ``async_delivery_supported()`` gates
-        # it off and the run executes synchronously to completion instead.
-        # The declaration is scoped to this call (token reset in ``finally``)
-        # so in-process callers (tests, embedding apps) are not tainted.
-        try:
-            from gateway.session_context import _SESSION_ASYNC_DELIVERY
-
-            _stateless_token = _SESSION_ASYNC_DELIVERY.set(False)
-
-            def _stateless_reset() -> None:
-                _SESSION_ASYNC_DELIVERY.reset(_stateless_token)
-        except Exception:
-            _stateless_reset = None
-    try:
-        result = _cron_api(action=action, job_id=job_id)
-    finally:
-        if _stateless_reset is not None:
-            _stateless_reset()
+    result = _cron_api(action=action, job_id=job_id)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -536,21 +488,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
         print(f"  Next run: {result['job']['next_run_at']}")
     if action == "run":
         job = result.get("job", {})
-        # A manual run can be dispatched to the gateway daemon's background
-        # delegation worker instead of executing inline (e.g. when the CLI
-        # process inherits a gateway/desktop session env and the run
-        # resolves a session key). Such responses carry
-        # execution_mode="background" and/or a delegation_id, and the job
-        # keeps running AFTER this CLI process exits — a terminal
-        # success/failure verdict would be a lie (#83340). Report the
-        # background dispatch instead of claiming the run failed.
-        delegation_id = job.get("delegation_id")
-        if job.get("execution_mode") == "background" or delegation_id:
-            if delegation_id:
-                print(f"  Running in background (delegation {delegation_id}).")
-            else:
-                print("  Running in background.")
-        elif job.get("executed"):
+        if job.get("executed"):
             outcome = "succeeded" if job.get("execution_success") else "failed"
             print(f"  Ran now: {outcome}.")
         elif job.get("execution_skipped"):
@@ -637,7 +575,8 @@ def cron_command(args):
         return 0
 
     if subcmd == "tick":
-        return cron_tick()
+        cron_tick()
+        return 0
 
     if subcmd in {"runs", "history"}:
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
