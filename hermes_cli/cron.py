@@ -223,6 +223,30 @@ def _last_run_display(job: Dict[str, Any]) -> str:
     return display
 
 
+def _job_model_display(job: Dict[str, Any]) -> tuple[str, str]:
+    """``(model, provider)`` effective cho 1 job khi hiển thị ``cron list``.
+
+    Local customization (pi-patch 001): hiện model/provider của từng job. Giá trị riêng của job
+    được ưu tiên; nếu thiếu thì lấy default trong config để phản ánh đúng model job sẽ chạy.
+    """
+    model = str(job.get("model") or "").strip()
+    provider = str(job.get("provider") or "").strip()
+    if model and provider:
+        return model, provider
+    try:
+        from hermes_cli.config import load_config
+
+        model_cfg = (load_config() or {}).get("model") or {}
+    except Exception:
+        model_cfg = {}
+    if isinstance(model_cfg, dict):
+        model = model or str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        provider = provider or str(model_cfg.get("provider") or "").strip()
+    elif isinstance(model_cfg, str):
+        model = model or model_cfg.strip()
+    return model, provider
+
+
 def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     """``(label, value)`` detail rows for one job in ``cron list``."""
     # `repeat` / `deliver` may be present-but-null (dict-default only covers a missing key).
@@ -236,6 +260,7 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
     monitor_source = job.get("monitor_script") or job.get("monitor_url")
     mon_state = job.get("monitor_state") or {}
     latest_execution = job.get("latest_execution") or {}
+    job_model, job_provider = _job_model_display(job)
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
@@ -245,6 +270,8 @@ def _job_rows(job: Dict[str, Any]) -> List[tuple[str, str]]:
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
         ("Workdir", job.get("workdir")),
+        ("Model", job_model),
+        ("Provider", job_provider),
         ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
@@ -294,17 +321,6 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
     fire_err = job.get("last_fire_error")
     if isinstance(fire_err, dict) and fire_err.get("detail"):
         lines.append(color(f"⚠ {_missed_fire_issue(job, fire_err)}", Colors.RED))
-    # Sticky last-failure stamp (#118354): survives a later success, so a job that
-    # self-healed still shows that a run failed recently. While last_status itself
-    # reports the failure this is redundant-but-consistent; after recovery it is the
-    # only job-level trace left.
-    last_failure = job.get("last_failure")
-    if isinstance(last_failure, dict) and last_failure.get("detail"):
-        recovered = str(job.get("last_status") or "") in {"ok", "delivery_queued"}
-        lines.append(color(
-            f"⚠ Last failure at {last_failure.get('at', '?')}: "
-            f"{_short_reason(last_failure['detail'])}" + (" — recovered since" if recovered else ""),
-            Colors.YELLOW if recovered else Colors.RED))
     return lines
 
 
