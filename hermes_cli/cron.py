@@ -225,6 +225,30 @@ def _last_run_display(job: dict[str, Any]) -> str:
     return display
 
 
+def _job_model_display(job: dict[str, Any]) -> tuple[str, str]:
+    """``(model, provider)`` effective cho 1 job khi hiển thị ``cron list``.
+
+    Local customization (pi-patch 001): hiện model/provider của từng job. Giá trị riêng của job
+    được ưu tiên; nếu thiếu thì lấy default trong config để phản ánh đúng model job sẽ chạy.
+    """
+    model = str(job.get("model") or "").strip()
+    provider = str(job.get("provider") or "").strip()
+    if model and provider:
+        return model, provider
+    try:
+        from hermes_cli.config import load_config
+
+        model_cfg = (load_config() or {}).get("model") or {}
+    except Exception:
+        model_cfg = {}
+    if isinstance(model_cfg, dict):
+        model = model or str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
+        provider = provider or str(model_cfg.get("provider") or "").strip()
+    elif isinstance(model_cfg, str):
+        model = model or model_cfg.strip()
+    return model, provider
+
+
 def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
     """``(label, value)`` detail rows for one job in ``cron list``."""
     # `repeat` / `deliver` may be present-but-null (dict-default only covers a missing key).
@@ -238,6 +262,7 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
     monitor_source = job.get("monitor_script") or job.get("monitor_url")
     mon_state = job.get("monitor_state") or {}
     latest_execution = job.get("latest_execution") or {}
+    job_model, job_provider = _job_model_display(job)
     optional = [
         ("Skills", ", ".join(skills) if skills else ""),
         ("Script", job.get("script")),
@@ -249,6 +274,8 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Timezone", job.get("timezone")),
         ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
         ("Workdir", job.get("workdir")),
+        ("Model", job_model),
+        ("Provider", job_provider),
         ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
          if job.get("last_status") else ""),
