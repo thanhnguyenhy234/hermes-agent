@@ -377,7 +377,13 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
             else:
                 result = await list_method(cursor=cursor)
         if cache_meta_out is not None and not items:
+            # The Python MCP SDK gives ListToolsResult default values for optional SEP-2549
+            # hints. Do not mistake an SDK default for a hint sent by the server: in particular,
+            # ttl_ms=0 means "expire immediately" and would disable lazy schema-cache reuse.
+            fields_set = getattr(result, "model_fields_set", None)
             for key, snake, camel in (("ttl_ms", "ttl_ms", "ttlMs"), ("cache_scope", "cache_scope", "cacheScope")):
+                if isinstance(fields_set, (set, frozenset)) and snake not in fields_set and camel not in fields_set:
+                    continue
                 hint = mcp_field(result, snake, camel)
                 if hint is not None:
                     cache_meta_out[key] = hint

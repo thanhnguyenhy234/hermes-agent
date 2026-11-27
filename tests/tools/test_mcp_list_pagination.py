@@ -31,6 +31,38 @@ class TestPaginateFullList:
         assert [t.name for t in items] == ["a", "b"]
         list_method.assert_called_once_with()
 
+    def test_sdk_default_cache_hints_are_not_recorded(self):
+        """SDK defaults are not server hints; an omitted TTL must stay omitted."""
+        result = SimpleNamespace(tools=[_tool("a")], ttl_ms=0, cache_scope="public",
+                                 model_fields_set={"tools"})
+        list_method = AsyncMock(return_value=result)
+        hints = {}
+
+        asyncio.run(_paginate_full_list(list_method, "tools", "srv", cache_meta_out=hints))
+
+        assert hints == {}
+
+    def test_explicit_cache_hints_are_recorded_even_when_ttl_is_zero(self):
+        """An explicit zero TTL is a real server instruction, not an SDK default."""
+        result = SimpleNamespace(tools=[_tool("a")], ttl_ms=0, cache_scope="private",
+                                 model_fields_set={"tools", "ttl_ms", "cache_scope"})
+        list_method = AsyncMock(return_value=result)
+        hints = {}
+
+        asyncio.run(_paginate_full_list(list_method, "tools", "srv", cache_meta_out=hints))
+
+        assert hints == {"ttl_ms": 0, "cache_scope": "private"}
+
+    def test_legacy_result_without_field_set_keeps_existing_behavior(self):
+        """Non-Pydantic SDK result objects retain backwards-compatible hint handling."""
+        result = SimpleNamespace(tools=[_tool("a")], ttl_ms=0)
+        list_method = AsyncMock(return_value=result)
+        hints = {}
+
+        asyncio.run(_paginate_full_list(list_method, "tools", "srv", cache_meta_out=hints))
+
+        assert hints == {"ttl_ms": 0}
+
 
     def test_runaway_cursor_capped(self):
         """A server that returns a cursor forever is bounded by the page cap."""
