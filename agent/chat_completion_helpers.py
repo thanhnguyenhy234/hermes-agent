@@ -2024,7 +2024,8 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             if cooldown_seconds is not None:
                 remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
                 notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
-            announce_fallback_switch(agent, notice)
+            announce_fallback_switch(
+                agent, notice, pair=(f"{old_model} via {old_provider}", f"{fb_model} via {fb_provider}"))
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
